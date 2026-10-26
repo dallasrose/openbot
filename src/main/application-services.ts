@@ -1751,10 +1751,20 @@ export async function createApplicationServices({
     listRoutines: (agentId) => service.listRoutines(agentId),
     runRoutine: (input) => service.runRoutineFromAutomation(input),
     sendMessage: (input) => service.sendMessage(input),
+    listTasks: (agentId) => service.listTasks(agentId),
+    readTask: (agentId, taskId) => service.readTask(agentId, taskId),
+    startTask: (input) => service.startTask(input),
+    deliveryTaskId: (deliveryId) => mailbox.taskIdForDelivery(deliveryId),
     getLocalAttention: (agentId) => service.getLocalAttention(agentId),
     respondToLocalAttention: (agentId, input) => service.respondToLocalAttention(agentId, input),
     delivery: (deliveryId) => mailbox.getDelivery(deliveryId)?.delivery ?? null,
-    turnAnswer,
+    turnAnswer: (agentId, turnId, taskId) => {
+      if (!taskId) return turnAnswer(agentId, turnId);
+      const threadId = service.readTask(agentId, taskId).threadId;
+      return threadId
+        ? (latestTurnAnswer(store.database.readTurnAssistantMessages(agentId, threadId, turnId), turnId)?.text ?? null)
+        : null;
+    },
     updateAgent: (input) => service.updateAgent(input),
     clearAgentContext: (agentId) => service.clearAgentContext(agentId),
   });

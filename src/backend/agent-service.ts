@@ -397,6 +397,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     profileClients: this.#profileClients,
   });
   #scope = Scope.makeUnsafe();
+  /** Task starts still before their first mailbox write, by retry key. */
+  readonly #pendingTaskStarts = new Map<string, Deferred.Deferred<AgentTask, AgentLifecycleFailed>>();
   /** User sends still before their mailbox write, by idempotency key: a retry joins the first call. */
   readonly #pendingUserSends = new Map<string, Deferred.Deferred<QueuedMessageReceipt, AgentLifecycleFailed>>();
   readonly #store: AgentStore;
@@ -3967,6 +3969,33 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     sender?: ConversationMessageSender,
     timezone?: string,
   ): Effect.fn.Return<AgentTask, AgentLifecycleFailed> {
+    if (!input.clientMessageId) return yield* this.#startUserTask(input, sender, timezone);
+    const key = userSendKey(input.agentId, input.clientMessageId, sender);
+    this.#mailbox.forgetIdempotencyKeys("user-send:", new Date(Date.now() - USER_SEND_RETRY_WINDOW_MS));
+    const pending = this.#pendingTaskStarts.get(key);
+    if (pending) return yield* Deferred.await(pending);
+    const started = this.#mailbox.deliveryForKey(key);
+    if (started) {
+      const taskId = this.#mailbox.taskIdForDelivery(started.delivery.id);
+      return yield* lifecycleStep("read started task", () => {
+        if (!taskId) throw new Error(sourceText("error.backend.taskNotFound"));
+        return this.#tasks.publicTask(this.#tasks.require(input.agentId, taskId));
+      });
+    }
+    const start = Deferred.makeUnsafe<AgentTask, AgentLifecycleFailed>();
+    this.#pendingTaskStarts.set(key, start);
+    return yield* this.#startUserTask(input, sender, timezone).pipe(
+      Effect.onExit((exit) => Deferred.done(start, exit)),
+      Effect.ensuring(Effect.sync(() => this.#pendingTaskStarts.delete(key))),
+    );
+  }).bind(this);
+
+  readonly #startUserTask = Effect.fn("AgentService.startUserTask")(function* (
+    this: AgentService,
+    input: StartAgentTaskInput,
+    sender?: ConversationMessageSender,
+    timezone?: string,
+  ): Effect.fn.Return<AgentTask, AgentLifecycleFailed> {
     const task = yield* lifecycleStep("start task", () => {
       if (!this.listAgents().some((agent) => agent.id === input.agentId))
         throw new Error(sourceText("error.agent.unknown", { id: input.agentId }));
@@ -4200,9 +4229,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     timezone?: string,
   ): Effect.fn.Return<QueuedMessageReceipt, AgentLifecycleFailed> {
     if (!input.clientMessageId) return yield* this.#sendUserMessage(input, sender, timezone);
-    const idempotencyKey = `user-send:${createHash("sha256")
-      .update(JSON.stringify([sender?.id ?? null, input.agentId, input.clientMessageId]))
-      .digest("hex")}`;
+    const idempotencyKey = userSendKey(input.agentId, input.clientMessageId, sender);
     // Every user message adds a key, and the map is persisted whole, so keys older than the window go.
     this.#mailbox.forgetIdempotencyKeys("user-send:", new Date(Date.now() - USER_SEND_RETRY_WINDOW_MS));
     const stored = this.#mailbox.receiptForKey(idempotencyKey);
@@ -4701,4 +4728,11 @@ function settleLifecycleTasks<A>(
       discard: true,
     },
   );
+}
+
+/** Shared by task creation and its first user message, so a retry finds the persisted task. */
+function userSendKey(agentId: string, clientMessageId: string, sender?: ConversationMessageSender): string {
+  return `user-send:${createHash("sha256")
+    .update(JSON.stringify([sender?.id ?? null, agentId, clientMessageId]))
+    .digest("hex")}`;
 }

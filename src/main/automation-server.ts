@@ -7,6 +7,7 @@ import {
   type AgentDefaults,
   type AgentModelOption,
   type AgentSummary,
+  type AgentTask,
   agentAutomationAllowed,
   isAgentModel,
   isAgentProvider,
@@ -43,6 +44,7 @@ const HOUR_MS = 60 * 60 * 1000;
 // A payload is at most 4,000 characters; four UTF-8 bytes each plus JSON escapes stay below this.
 const BODY_LIMIT_BYTES = 32 * 1024;
 const RUN_PATH = /^\/v1\/agents\/([^/]+)\/routines\/([^/]+)\/run$/;
+const TASK_PATH = /^\/v1\/agents\/([^/]+)\/tasks(?:\/([^/]+)(?:\/(messages|deliveries\/([^/]+)))?)?$/;
 const AGENT_PATH =
   /^\/v1\/agents\/([^/]+)\/(messages|pending|settings|context\/clear|deliveries\/([^/]+)|prompts\/([^/]+)\/answer|approvals\/([^/]+)\/respond)$/;
 /** A delivery in one of these states has no more work. Its turn's answer is final. */
@@ -87,12 +89,17 @@ export interface AutomationServerOptions {
   }) => Effect.Effect<Pick<RoutineRun, "id" | "deliveryId">, AgentLifecycleFailed>;
   now?: () => number;
   sendMessage: AgentService["sendMessage"];
+  listTasks: AgentService["listTasks"];
+  readTask: AgentService["readTask"];
+  startTask: AgentService["startTask"];
+  /** The task lane of a delivery, or null for main chat. */
+  deliveryTaskId: (deliveryId: string) => string | null;
   getLocalAttention: AgentService["getLocalAttention"];
   respondToLocalAttention: AgentService["respondToLocalAttention"];
   /** A delivery by its ID, or null when it is gone. */
   delivery: (deliveryId: string) => Pick<QueueDelivery, "recipientAgentId" | "status" | "turnId" | "error"> | null;
   /** The answer an agent gave in one turn, or null when it gave none. */
-  turnAnswer: (agentId: string, turnId: string) => string | null;
+  turnAnswer: (agentId: string, turnId: string, taskId?: string) => string | null;
   /** The same update as the agent's settings. It refuses a provider or account change while the agent works. */
   updateAgent: (input: UpdateAgentInput) => Effect.Effect<UpdatedAgent, { readonly cause: unknown }>;
   /** The same as **New chat** in the agent's settings. It fails with `ContextResetBusyError` while the agent works. */
@@ -227,6 +234,14 @@ export class AutomationServer {
         if (request.method !== "GET") return send(response, 405, { error: "method not allowed" });
         return send(response, 200, this.#listAgents());
       }
+      const taskMatch = TASK_PATH.exec(path);
+      if (taskMatch?.[1]) {
+        const agentId = decodePathPart(taskMatch[1]);
+        const taskId = taskMatch[2] === undefined ? undefined : decodePathPart(taskMatch[2]);
+        if (!agentId || taskId === null) return send(response, 404, { error: "not found" });
+        await this.#taskRequest(request, response, agentId, taskId, taskMatch[3], taskMatch[4]);
+        return;
+      }
       const agentMatch = AGENT_PATH.exec(path);
       if (agentMatch?.[1] && agentMatch[2]) {
         const agentId = decodePathPart(agentMatch[1]);
@@ -315,6 +330,8 @@ export class AutomationServer {
       });
     }
     if (route === "messages") {
+      if (value.taskId !== undefined || value.newTask !== undefined)
+        throw new HttpError(400, "Use the tasks route to target a task.");
       const text = requiredString(value, "text", INPUT_LIMITS.messageText);
       const clientMessageId = requiredString(value, "clientMessageId", INPUT_LIMITS.identifier);
       this.#requireNotHidden(agentId);
@@ -339,17 +356,82 @@ export class AutomationServer {
     send(response, 200, { ok: true });
   }
 
+  async #taskRequest(
+    request: IncomingMessage,
+    response: ServerResponse,
+    agentId: string,
+    taskId: string | undefined,
+    route: string | undefined,
+    encodedDeliveryId: string | undefined,
+  ): Promise<void> {
+    this.#requireAgent(agentId);
+    this.#requireNotHidden(agentId);
+    const task = taskId === undefined ? undefined : this.#requireTask(agentId, taskId);
+    if (request.method === "GET") {
+      if (route?.startsWith("deliveries/")) {
+        const deliveryId = encodedDeliveryId === undefined ? null : decodePathPart(encodedDeliveryId);
+        if (!deliveryId || this.#options.deliveryTaskId(deliveryId) !== taskId) throw new HttpError(404, "not found");
+        return send(response, 200, this.#deliveryResult(agentId, deliveryId));
+      }
+      if (route !== undefined) return send(response, 405, { error: "method not allowed" });
+      return send(
+        response,
+        200,
+        task ? { task, conversation: this.#options.readTask(agentId, task.id) } : this.#options.listTasks(agentId),
+      );
+    }
+    if (request.method !== "POST" || (task && route !== "messages"))
+      return send(response, 405, { error: "method not allowed" });
+    const value = await readJson(request);
+    this.#requireAgent(agentId);
+    this.#requireNotHidden(agentId);
+    const text = requiredString(value, "text", INPUT_LIMITS.messageText);
+    const clientMessageId = requiredString(value, "clientMessageId", INPUT_LIMITS.identifier);
+    // Main chat, task starts and each task have separate retry keys.
+    const retryId = task
+      ? `automation-task-send:${task.id}:${clientMessageId}`
+      : `automation-task-start:${clientMessageId}`;
+    if (task && this.#requireTask(agentId, task.id).closedAt !== null)
+      throw new HttpError(409, sourceText("error.backend.taskClosed"));
+    const now = this.#takeSlot(agentId);
+    try {
+      const target =
+        task ?? (await runCauseEffect(this.#options.startTask({ agentId, text, clientMessageId: retryId })));
+      // startTask has already stored this message. Its retry key returns that receipt.
+      const receipt = await runCauseEffect(
+        this.#options.sendMessage({
+          agentId,
+          taskId: target.id,
+          text,
+          clientMessageId: retryId,
+        }),
+      );
+      return send(response, 202, { taskId: target.id, ...receipt });
+    } catch (error) {
+      this.#releaseSlot(agentId, now);
+      throw error;
+    }
+  }
+
+  #requireTask(agentId: string, taskId: string): AgentTask {
+    const task = this.#options.listTasks(agentId).tasks.find((candidate) => candidate.id === taskId);
+    if (!task) throw new HttpError(404, "not found");
+    return task;
+  }
+
   /** The state of one message delivery to this agent, and the turn's answer once the delivery ended. */
   #deliveryResult(agentId: string, deliveryId: string) {
     const delivery = this.#options.delivery(deliveryId);
     if (!delivery || delivery.recipientAgentId !== agentId) throw new HttpError(404, "not found");
     const ended = ENDED_DELIVERY_STATUSES.has(delivery.status);
+    const taskId = this.#options.deliveryTaskId(deliveryId);
     return {
       id: deliveryId,
+      ...(taskId ? { taskId } : {}),
       status: delivery.status,
       turnId: delivery.turnId,
       error: delivery.error,
-      answer: ended && delivery.turnId ? this.#options.turnAnswer(agentId, delivery.turnId) : null,
+      answer: ended && delivery.turnId ? this.#options.turnAnswer(agentId, delivery.turnId, taskId ?? undefined) : null,
     };
   }
 

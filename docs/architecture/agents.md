@@ -34,6 +34,11 @@ expired handle cannot answer a later provider request. Pending details are not t
 snapshot budget. The HTTP boundary redacts outgoing values. Browser takeovers and secret questions
 are notices only and direct the person to OpenBot. Messages and routine runs share the rate limit.
 
+Task routes use the same Local scripts grant and listener. They call `AgentService.startTask`,
+`sendMessage` with a task ID, `listTasks` and `readTask`. A task start reuses the persisted first
+message retry key; concurrent starts with that key share one result. Task delivery answers use
+the task's thread, and scoped delivery reads reject other tasks and main-chat deliveries.
+
 ## Scheduled routine changes
 
 The agent scheduler reads the due list once per pass. It reads each routine again before it starts

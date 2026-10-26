@@ -1,8 +1,8 @@
 # Local scripts API
 
 A script on the computer that runs OpenBot can send an agent a message, wait for its answer, run a
-routine, read pending questions and approvals, submit responses, change the agent's model or
-provider account, and start a new chat with the agent. Enable **Local scripts** for each agent that the integration needs. Use this API
+routine, create or continue a separate task, read its conversation, read pending questions and
+approvals, submit responses, change the agent's model or provider account, and start a new chat with the agent. Enable **Local scripts** for each agent that the integration needs. Use this API
 for a local Slack bridge, to report a build result, or to give an agent a task from a terminal.
 
 ```sh
@@ -29,6 +29,11 @@ alias openbot-cli='node "/Applications/OpenBot.app/Contents/Resources/cli/openbo
 openbot-cli list                                    # the agents with Local scripts on
 openbot-cli run "Ada" "Run the tests and tell me what failed" --wait
 openbot-cli run "Ada" - --wait --json < task.md     # the task from standard input, one JSON answer
+openbot-cli run "Ada" "Review the build" --new-task --id build-review --wait --json
+openbot-cli run "Ada" "Check the revised build" --task <taskId> --id build-revision --wait --json
+openbot-cli task list "Ada" --json
+openbot-cli task read "Ada" <taskId> --json
+openbot-cli status "Ada" <deliveryId> --task <taskId> --json
 openbot-cli status "Ada" <deliveryId>               # a delivery that an earlier run left
 openbot-cli agent set-account "Ada" <accountId>     # or "default" for the provider's own sign-in
 openbot-cli agent set-model "Ada" claude-opus-5-5 --effort high
@@ -39,6 +44,13 @@ openbot-cli agent new-chat "Ada"                    # the agent forgets the chat
 message is in the queue. With `--wait`, it prints the turn's answer when the turn ends. `--timeout`
 (`90s`, `5m`, `2h`; default `30m`) stops only the wait, not the work. `--id <key>` is the retry key
 of the message (see `POST /v1/agents/:agentId/messages`); without it each run sends a new message.
+`--new-task` creates a separate task and returns its `taskId`. `--task <taskId>` sends to an
+existing open task of the selected agent. Use one of these options, never both. Without either
+option, `run` sends to the main chat, as before. A task that is missing, closed, or belongs to
+another agent is refused; the command never sends that message to the main chat. Task sends use
+the same queue, task limits and Local scripts request limit. Tasks share the agent's workspace,
+memories, provider and permissions; only their conversations and execution lanes are separate.
+
 With `--json`, the output is one JSON object, also for a failure (`{ "ok": false, "exitCode", "error" }`).
 
 | Exit code | Meaning |
@@ -168,6 +180,43 @@ The state of one message delivery to this agent. Use the delivery ID from the me
 `answer` is the agent's last answer in the turn. It is `null` until the delivery ends, and when the
 agent gave no answer. A delivery to another agent, or one that is gone, gives `404`. This read does
 not use the request limit.
+
+### Tasks
+
+These routes use the same loopback listener, bearer token, per-agent **Local scripts** setting,
+hidden-agent refusal and rate limit as messages. They do not create a credential or grant access
+to another agent. Read requests do not use the rate limit. No external messaging service is required.
+
+| Method and route | Result |
+| --- | --- |
+| `GET /v1/agents/:agentId/tasks` | The agent's task list and concurrency limit, as in OpenBot. |
+| `POST /v1/agents/:agentId/tasks` | Create a task with its first message. |
+| `GET /v1/agents/:agentId/tasks/:taskId` | `{ "task": <task>, "conversation": <conversation> }`, including state, outcome, error, progress and the task's conversation snapshot. |
+| `POST /v1/agents/:agentId/tasks/:taskId/messages` | Queue a message in that open task. |
+| `GET /v1/agents/:agentId/tasks/:taskId/deliveries/:deliveryId` | The delivery status and final answer from that task's thread. |
+
+Both POST routes require `{ "text": string, "clientMessageId": string }` and
+`Content-Type: application/json`, with the same bounds as the messages route. The first line of a
+new task's text becomes its title. The response is `202` with `taskId`, `messageId` and `deliveries`.
+Acceptance means queued work, not a completed answer. Read the delivery until its status ends,
+or use `run --wait`. The task stays available in OpenBot after completion.
+
+Keep the same `clientMessageId` when retrying a lost response. A task-start retry within one day
+returns the original task and first message receipt, also after an app restart once the message
+was stored. Concurrent start retries join the first request. Each task's message retry keys are
+separate from task starts and main chat. A retry key identifies the first accepted request; use a
+new key for a new message. As with other local message sends, retries count toward the rate limit.
+
+A task or delivery of another agent, or a delivery from a different task or main chat, gives `404`
+on the scoped task routes. Sending to a closed task gives `409`. A malformed task path never
+falls back to the messages route. The main messages route refuses `taskId` and `newTask` fields;
+use the task routes instead. The existing delivery route can also read a task delivery by ID and
+includes its `taskId`; its answer comes from that task, never from the main conversation.
+
+`task read` returns a conversation snapshot, not unlimited history. Provider questions and
+approvals still appear in OpenBot's main chat and through the existing agent-wide `pending`
+route. The CLI's attention check remains agent-wide; an unrelated pending question can end
+`--wait` with exit code 3. Read `status --task` again after the question is resolved.
 
 ### `POST /v1/agents/:agentId/settings`
 

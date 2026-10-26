@@ -11,8 +11,10 @@ import { join } from "node:path";
 
 const USAGE = `Usage:
   openbot-cli list [--json]
-  openbot-cli run <agent> <task|-> [--wait] [--timeout 30m] [--id <key>] [--json]
-  openbot-cli status <agent> <deliveryId> [--json]
+  openbot-cli run <agent> <task|-> [--new-task | --task <taskId>] [--wait] [--timeout 30m] [--id <key>] [--json]
+  openbot-cli status <agent> <deliveryId> [--task <taskId>] [--json]
+  openbot-cli task list <agent> [--json]
+  openbot-cli task read <agent> <taskId> [--json]
   openbot-cli agent set-account <agent> <accountId|default> [--json]
   openbot-cli agent set-model <agent> <model> [--effort <effort>] [--provider <provider>] [--json]
   openbot-cli agent new-chat <agent> [--json]
@@ -155,8 +157,8 @@ function duration(value) {
  * @returns {{ positional: string[], flags: Map<string, string | true> }}
  */
 function parse(argv) {
-  const valued = new Set(["--timeout", "--id", "--effort", "--provider"]);
-  const known = new Set([...valued, "--json", "--wait", "--help"]);
+  const valued = new Set(["--timeout", "--id", "--effort", "--provider", "--task"]);
+  const known = new Set([...valued, "--json", "--wait", "--new-task", "--help"]);
   /** @type {string[]} */
   const positional = [];
   /** @type {Map<string, string | true>} */
@@ -199,14 +201,16 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * @param {{ id: string, name: string }} agent
  * @param {string} deliveryId
  * @param {number} timeoutMs
+ * @param {string} [taskId]
  */
-async function waitForDelivery(target, agent, deliveryId, timeoutMs) {
+async function waitForDelivery(target, agent, deliveryId, timeoutMs, taskId) {
   const base = `/v1/agents/${encodeURIComponent(agent.id)}`;
+  const deliveryBase = taskId ? `${base}/tasks/${encodeURIComponent(taskId)}` : base;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     let delivery;
     try {
-      delivery = await request(target, "GET", `${base}/deliveries/${encodeURIComponent(deliveryId)}`);
+      delivery = await request(target, "GET", `${deliveryBase}/deliveries/${encodeURIComponent(deliveryId)}`);
       if (ENDED.has(delivery.status)) {
         return { result: delivery, exitCode: delivery.status === "completed" ? EXIT.done : EXIT.failed };
       }
@@ -238,6 +242,25 @@ async function main(positional, flags) {
   // task queued and is a usage error also when OpenBot is off.
   const timeout = flags.get("--timeout");
   const timeoutMs = duration(typeof timeout === "string" ? timeout : "30m");
+  const taskId = flags.get("--task");
+  if (flags.has("--new-task") && (taskId !== undefined || command !== "run"))
+    throw new CliError("Use --new-task only with run, without --task.", EXIT.usage);
+  if (taskId !== undefined && (typeof taskId !== "string" || !taskId.trim() || !["run", "status"].includes(command)))
+    throw new CliError("Use --task <taskId> with run or status.", EXIT.usage);
+  if (command === "task") {
+    const [action, reference, id] = rest;
+    if (
+      !reference ||
+      !["list", "read"].includes(action ?? "") ||
+      (action === "list" ? rest.length !== 2 : rest.length !== 3 || !id)
+    )
+      throw new CliError(USAGE, EXIT.usage);
+    const target = await connection();
+    const agent = await findAgent(target, reference);
+    const path = `/v1/agents/${encodeURIComponent(agent.id)}/tasks${id ? `/${encodeURIComponent(id)}` : ""}`;
+    const result = await request(target, "GET", path);
+    return { result, exitCode: EXIT.done, text: JSON.stringify(result, null, 2) };
+  }
   if (command === "list") {
     if (rest.length > 0) throw new CliError(USAGE, EXIT.usage);
     const target = await connection();
@@ -256,7 +279,13 @@ async function main(positional, flags) {
     const target = await connection();
     const agent = await findAgent(target, reference);
     const id = flags.get("--id");
-    const receipt = await request(target, "POST", `/v1/agents/${encodeURIComponent(agent.id)}/messages`, {
+    const base = `/v1/agents/${encodeURIComponent(agent.id)}`;
+    const route = flags.has("--new-task")
+      ? `${base}/tasks`
+      : typeof taskId === "string"
+        ? `${base}/tasks/${encodeURIComponent(taskId)}/messages`
+        : `${base}/messages`;
+    const receipt = await request(target, "POST", route, {
       text,
       clientMessageId: typeof id === "string" ? id : `cli-${randomUUID()}`,
     });
@@ -266,12 +295,18 @@ async function main(positional, flags) {
     if (!delivery) throw new CliError("OpenBot did not queue the message.", EXIT.failed);
     if (!flags.has("--wait")) {
       return {
-        result: { agent, messageId: receipt.messageId, deliveryId: delivery.id, status: delivery.status },
+        result: {
+          agent,
+          ...(receipt.taskId ? { taskId: receipt.taskId } : {}),
+          messageId: receipt.messageId,
+          deliveryId: delivery.id,
+          status: delivery.status,
+        },
         exitCode: EXIT.done,
-        text: `Queued for ${agent.name}: delivery ${delivery.id} (${delivery.status}).`,
+        text: `Queued for ${agent.name}${receipt.taskId ? ` in task ${receipt.taskId}` : ""}: delivery ${delivery.id} (${delivery.status}).`,
       };
     }
-    const waited = await waitForDelivery(target, agent, delivery.id, timeoutMs);
+    const waited = await waitForDelivery(target, agent, delivery.id, timeoutMs, receipt.taskId);
     return {
       result: { agent, messageId: receipt.messageId, deliveryId: delivery.id, ...waited.result },
       exitCode: waited.exitCode,
@@ -283,7 +318,8 @@ async function main(positional, flags) {
     if (!reference || !deliveryId || rest.length > 2) throw new CliError(USAGE, EXIT.usage);
     const target = await connection();
     const agent = await findAgent(target, reference);
-    const path = `/v1/agents/${encodeURIComponent(agent.id)}/deliveries/${encodeURIComponent(deliveryId)}`;
+    const base = `/v1/agents/${encodeURIComponent(agent.id)}`;
+    const path = `${base}${typeof taskId === "string" ? `/tasks/${encodeURIComponent(taskId)}` : ""}/deliveries/${encodeURIComponent(deliveryId)}`;
     const delivery = await request(target, "GET", path);
     const exitCode = !ENDED.has(delivery.status) || delivery.status === "completed" ? EXIT.done : EXIT.failed;
     return { result: { agent, ...delivery }, exitCode, text: describeDelivery(agent, delivery) };
